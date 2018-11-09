@@ -1,30 +1,58 @@
+"""
+A maintenance workflow that you can deploy into Airflow to periodically
+kill off tasks that are running in the background that
+don't correspond to a running task in the DB.
+
+This is useful because when you kill off a DAG Run or Task
+through the Airflow Web Server, the task still runs in the background
+on one of the executors until the task is complete.
+
+airflow trigger_dag maintenance.tasks.halted.kill
+"""
+
 from airflow.models import DAG, DagModel, DagRun, TaskInstance, settings
-from airflow.operators import PythonOperator, ShortCircuitOperator, EmailOperator
-from sqlalchemy import and_
-from datetime import datetime, timedelta
+from airflow.operators.email_operator import EmailOperator
+from airflow.operators.python_operator import (
+    PythonOperator,
+    ShortCircuitOperator
+)
+from airflow.utils import dates
+from datetime import timedelta
+import logging
 import os
 import re
-import logging
+from sqlalchemy import and_
 
-"""
-A maintenance workflow that you can deploy into Airflow to periodically kill off tasks that are running in the background that don't correspond to a running task in the DB.
+# DAG id
+DAG_PREFIX = 'maintenance'
+DAG_ID = f'{DAG_PREFIX}.tasks.halted.kill'
 
-This is useful because when you kill off a DAG Run or Task through the Airflow Web Server, the task still runs in the background on one of the executors until the task is complete.
+# How often to Run. @daily - Once a day at Midnight. @hourly - Once an Hour.
+SCHEDULE_INTERVAL = "@hourly"
 
-airflow trigger_dag airflow-kill-halted-tasks
+# Who is listed as the owner of this DAG in the Airflow Web Server
+DAG_OWNER_NAME = "airflow"
 
-"""
+# List of email address to send email alerts to if this job fails
+ALERT_EMAIL_ADDRESSES = [
+    'data@granular.ag'
+]
 
-DAG_ID = os.path.basename(__file__).replace(".pyc", "").replace(".py", "")  # airflow-kill-halted-tasks
-START_DATE = datetime.now() - timedelta(minutes=1)
-SCHEDULE_INTERVAL = "@hourly"           # How often to Run. @daily - Once a day at Midnight. @hourly - Once an Hour.
-DAG_OWNER_NAME = "operations"           # Who is listed as the owner of this DAG in the Airflow Web Server
-ALERT_EMAIL_ADDRESSES = []              # List of email address to send email alerts to if this job fails
-SEND_PROCESS_KILLED_EMAIL = True        # Whether to send out an email whenever a process was killed during a DAG Run or not
-PROCESS_KILLED_EMAIL_SUBJECT = DAG_ID + " - Tasks were Killed"  # Subject of the email that is sent out when a task is killed by the DAG
-PROCESS_KILLED_EMAIL_ADDRESSES = []     # List of email address to send emails to when a task is killed by the DAG
-ENABLE_KILL = True                      # Whether the job should delete the db entries or not. Included if you want to temporarily avoid deleting the db entries.
-DEBUG = False                           # Whether to print out certain statements meant for debugging
+# Whether to send out an email whenever a process was killed during a DAG Run or not
+SEND_PROCESS_KILLED_EMAIL = True
+# Subject of the email that is sent out when a task is killed by the DAG
+PROCESS_KILLED_EMAIL_SUBJECT = DAG_ID + " - Tasks were Killed"
+# List of email address to send emails to when a task is killed by the DAG
+PROCESS_KILLED_EMAIL_ADDRESSES = []
+
+# Whether the job should delete the db entries or not.
+# Included if you want to temporarily avoid deleting the db entries.
+ENABLE_KILL = True
+
+# Whether to print out certain statements meant for debugging
+DEBUG = False
+
+START_DATE = dates.days_ago(1)
 
 default_args = {
     'owner': DAG_OWNER_NAME,
@@ -33,10 +61,9 @@ default_args = {
     'email_on_retry': False,
     'start_date': START_DATE,
     'retries': 1,
-    'retry_delay': timedelta(minutes=1)
+    'retry_delay': timedelta(minutes=1),
+    'catchup': False
 }
-
-dag = DAG(DAG_ID, default_args=default_args, schedule_interval=SCHEDULE_INTERVAL, start_date=START_DATE)
 
 uid_regex = "(\w+)"
 pid_regex = "(\w+)"
@@ -51,7 +78,6 @@ command_regex = "(.+)"
 full_regex = '\s*' + uid_regex + '\s+' + pid_regex + '\s+' + ppid_regex + '\s+' + processor_scheduling_regex + '\s+' + start_time_regex + '\s+' + tty_regex + '\s+' + cpu_time_regex + '\s+' + command_regex
 
 airflow_run_regex = '.*run\s([\w_-]*)\s([\w_-]*)\s([\w:.-]*).*'
-
 
 def parse_process_linux_string(line):
     if DEBUG:
@@ -243,13 +269,6 @@ def kill_halted_tasks_function(**context):
     logging.info("")
     logging.info("Finished Running Cleanup Process")
 
-kill_halted_tasks = PythonOperator(
-    task_id='kill_halted_tasks',
-    python_callable=kill_halted_tasks_function,
-    provide_context=True,
-    dag=dag)
-
-
 def branch_function(**context):
     logging.info("Deciding whether to send an email about tasks that were killed by this DAG...")
     logging.info("SEND_PROCESS_KILLED_EMAIL: '" + str(SEND_PROCESS_KILLED_EMAIL) + "'")
@@ -279,64 +298,74 @@ def branch_function(**context):
     logging.info("Opting to skip sending an email since no processes were killed")
     return False  # False = short circuit the dag and don't execute downstream tasks
 
-email_or_not_branch = ShortCircuitOperator(
-    task_id="email_or_not_branch",
-    python_callable=branch_function,
-    provide_context=True,
-    dag=dag)
+with DAG(
+    DAG_ID,
+    default_args=default_args,
+    schedule_interval=SCHEDULE_INTERVAL,
+    start_date=START_DATE
+) as dag:
 
+    kill_halted_tasks = PythonOperator(
+        task_id='kill_halted_tasks',
+        python_callable=kill_halted_tasks_function,
+        provide_context=True,
+    )
 
+    email_or_not_branch = ShortCircuitOperator(
+        task_id="email_or_not_branch",
+        python_callable=branch_function,
+        provide_context=True,
+    )
 
-send_processes_killed_email = EmailOperator(
-    task_id="send_processes_killed_email",
-    to=PROCESS_KILLED_EMAIL_ADDRESSES,
-    subject=PROCESS_KILLED_EMAIL_SUBJECT,
-    html_content="""
-    <html>
-        <body>
+    send_processes_killed_email = EmailOperator(
+        task_id="send_processes_killed_email",
+        to=PROCESS_KILLED_EMAIL_ADDRESSES,
+        subject=PROCESS_KILLED_EMAIL_SUBJECT,
+        html_content="""
+<html>
+    <body>
 
-            <h6>This is not a failure alert!</h6>
+        <h6>This is not a failure alert!</h6>
 
-            <h2>Dag Run Information</h2>
-            <table>
-                <tr><td><b> ID: </b></td><td>{{ dag_run.id }}</td></tr>
-                <tr><td><b> DAG ID: </b></td><td>{{ dag_run.dag_id }}</td></tr>
-                <tr><td><b> Execution Date: </b></td><td>{{ dag_run.execution_date }}</td></tr>
-                <tr><td><b> Start Date: </b></td><td>{{ dag_run.start_date }}</td></tr>
-                <tr><td><b> End Date: </b></td><td>{{ dag_run.end_date }}</td></tr>
-                <tr><td><b> Run ID: </b></td><td>{{ dag_run.run_id }}</td></tr>
-                <tr><td><b> External Trigger: </b></td><td>{{ dag_run.external_trigger }}</td></tr>
-            </table>
+        <h2>Dag Run Information</h2>
+        <table>
+            <tr><td><b> ID: </b></td><td>{{ dag_run.id }}</td></tr>
+            <tr><td><b> DAG ID: </b></td><td>{{ dag_run.dag_id }}</td></tr>
+            <tr><td><b> Execution Date: </b></td><td>{{ dag_run.execution_date }}</td></tr>
+            <tr><td><b> Start Date: </b></td><td>{{ dag_run.start_date }}</td></tr>
+            <tr><td><b> End Date: </b></td><td>{{ dag_run.end_date }}</td></tr>
+            <tr><td><b> Run ID: </b></td><td>{{ dag_run.run_id }}</td></tr>
+            <tr><td><b> External Trigger: </b></td><td>{{ dag_run.external_trigger }}</td></tr>
+        </table>
 
-            <h2>Task Instance Information</h2>
-            <table>
-                <tr><td><b> Task ID: </b></td><td>{{ task_instance.task_id }}</td></tr>
-                <tr><td><b> Execution Date: </b></td><td>{{ task_instance.execution_date }}</td></tr>
-                <tr><td><b> Start Date: </b></td><td>{{ task_instance.start_date }}</td></tr>
-                <tr><td><b> End Date: </b></td><td>{{ task_instance.end_date }}</td></tr>
-                <tr><td><b> Host Name: </b></td><td>{{ task_instance.hostname }}</td></tr>
-                <tr><td><b> Unix Name: </b></td><td>{{ task_instance.unixname }}</td></tr>
-                <tr><td><b> Job ID: </b></td><td>{{ task_instance.job_id }}</td></tr>
-                <tr><td><b> Queued Date Time: </b></td><td>{{ task_instance.queued_dttm }}</td></tr>
-                <tr><td><b> Log URL: </b></td><td><a href="{{ task_instance.log_url }}">{{ task_instance.log_url }}</a></td></tr>
-            </table>
+        <h2>Task Instance Information</h2>
+        <table>
+            <tr><td><b> Task ID: </b></td><td>{{ task_instance.task_id }}</td></tr>
+            <tr><td><b> Execution Date: </b></td><td>{{ task_instance.execution_date }}</td></tr>
+            <tr><td><b> Start Date: </b></td><td>{{ task_instance.start_date }}</td></tr>
+            <tr><td><b> End Date: </b></td><td>{{ task_instance.end_date }}</td></tr>
+            <tr><td><b> Host Name: </b></td><td>{{ task_instance.hostname }}</td></tr>
+            <tr><td><b> Unix Name: </b></td><td>{{ task_instance.unixname }}</td></tr>
+            <tr><td><b> Job ID: </b></td><td>{{ task_instance.job_id }}</td></tr>
+            <tr><td><b> Queued Date Time: </b></td><td>{{ task_instance.queued_dttm }}</td></tr>
+            <tr><td><b> Log URL: </b></td><td><a href="{{ task_instance.log_url }}">{{ task_instance.log_url }}</a></td></tr>
+        </table>
 
-            <h2>Processes Killed</h2>
+        <h2>Processes Killed</h2>
+        <ul>
+        {% for process_killed in task_instance.xcom_pull(task_ids='kill_halted_tasks', key='kill_halted_tasks.processes_to_kill') %}
+            <li>Process {{loop.index}}</li>
             <ul>
-            {% for process_killed in task_instance.xcom_pull(task_ids='kill_halted_tasks', key='kill_halted_tasks.processes_to_kill') %}
-                <li>Process {{loop.index}}</li>
-                <ul>
-                {% for key, value in process_killed.iteritems() %}
-                    <li>{{ key }}: {{ value }}</li>
-                {% endfor %}
-                </ul>
+            {% for key, value in process_killed.iteritems() %}
+                <li>{{ key }}: {{ value }}</li>
             {% endfor %}
             </ul>
-        </body>
-    </html>
-    """,
-    dag=dag)
+        {% endfor %}
+        </ul>
+    </body>
+</html>
+        """,
+    )
 
-
-kill_halted_tasks.set_downstream(email_or_not_branch)
-email_or_not_branch.set_downstream(send_processes_killed_email)
+kill_halted_tasks >> email_or_not_branch
+email_or_not_branch >> send_processes_killed_email

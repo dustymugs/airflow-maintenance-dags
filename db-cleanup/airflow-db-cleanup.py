@@ -1,29 +1,56 @@
-from airflow.models import DAG, DagRun, TaskInstance, Log, XCom, SlaMiss, DagModel, Variable
-from airflow.jobs import BaseJob
-from airflow.models import settings
-from airflow.operators import PythonOperator
-from datetime import datetime, timedelta
-import os
-import logging
-
 """
-A maintenance workflow that you can deploy into Airflow to periodically clean out the DagRun, TaskInstance, Log, XCom, Job DB and SlaMiss entries to avoid having too much data in your Airflow MetaStore.
+A maintenance workflow that you can deploy into Airflow to periodically
+clean out the DagRun, TaskInstance, Log, XCom, Job DB and SlaMiss entries
+to avoid having too much data in your Airflow MetaStore.
 
-airflow trigger_dag --conf '{"maxDBEntryAgeInDays":30}' airflow-db-cleanup
+airflow trigger_dag --conf '{"maxDBEntryAgeInDays":30}' maintenance.db.cleanup
 
 --conf options:
     maxDBEntryAgeInDays:<INT> - Optional
-
 """
 
-DAG_ID = os.path.basename(__file__).replace(".pyc", "").replace(".py", "")  # airflow-db-cleanup
-START_DATE = datetime.now() - timedelta(minutes=1)
-SCHEDULE_INTERVAL = "@daily"            # How often to Run. @daily - Once a day at Midnight (UTC)
-DAG_OWNER_NAME = "operations"           # Who is listed as the owner of this DAG in the Airflow Web Server
-ALERT_EMAIL_ADDRESSES = []              # List of email address to send email alerts to if this job fails
-DEFAULT_MAX_DB_ENTRY_AGE_IN_DAYS = Variable.get("max_db_entry_age_in_days", 30) # Length to retain the log files if not already provided in the conf. If this is set to 30, the job will remove those files that are 30 days old or older.
-ENABLE_DELETE = True                    # Whether the job should delete the db entries or not. Included if you want to temporarily avoid deleting the db entries.
-DATABASE_OBJECTS = [                    # List of all the objects that will be deleted. Comment out the DB objects you want to skip.
+from airflow.jobs import BaseJob
+from airflow.models import (
+    DAG,
+    DagModel,
+    DagRun,
+    Log,
+    settings,
+    SlaMiss,
+    TaskInstance,
+    XCom,
+    Variable,
+)
+from airflow.operators.python_operator import PythonOperator
+from airflow.utils import dates
+from datetime import datetime, timedelta
+import logging
+
+# DAG id
+DAG_PREFIX = 'maintenance'
+DAG_ID = f'{DAG_PREFIX}.db.cleanup'
+
+# How often to Run. @daily - Once a day at Midnight (UTC)
+SCHEDULE_INTERVAL = "@daily"
+
+# Who is listed as the owner of this DAG in the Airflow Web Server
+DAG_OWNER_NAME = "airflow"
+
+# List of email address to send email alerts to if this job fails
+ALERT_EMAIL_ADDRESSES = [
+    'data@granular.ag'
+]
+
+# Length to retain the log files if not already provided in the conf.
+# If this is set to 30, the job will remove those files that are 30 days old or older.
+DEFAULT_MAX_DB_ENTRY_AGE_IN_DAYS = Variable.get("max_db_entry_age_in_days", 30)
+
+# Whether the job should delete the db entries or not. Included if you want to temporarily avoid deleting the db entries.
+ENABLE_DELETE = True
+
+# List of all the objects that will be deleted.
+# Comment out the DB objects you want to skip.
+DATABASE_OBJECTS = [
     {"airflow_db_model": DagRun, "age_check_column": DagRun.execution_date},
     {"airflow_db_model": TaskInstance, "age_check_column": TaskInstance.execution_date},
     {"airflow_db_model": Log, "age_check_column": Log.dttm},
@@ -32,6 +59,8 @@ DATABASE_OBJECTS = [                    # List of all the objects that will be d
     {"airflow_db_model": SlaMiss, "age_check_column": SlaMiss.execution_date},
     {"airflow_db_model": DagModel, "age_check_column": DagModel.last_scheduler_run},
 ]
+
+START_DATE = dates.days_ago(1)
 
 session = settings.Session()
 
@@ -42,11 +71,13 @@ default_args = {
     'email_on_retry': False,
     'start_date': START_DATE,
     'retries': 1,
-    'retry_delay': timedelta(minutes=1)
+    'retry_delay': timedelta(minutes=1),
+    'catchup': False
 }
 
-dag = DAG(DAG_ID, default_args=default_args, schedule_interval=SCHEDULE_INTERVAL, start_date=START_DATE)
-
+def close_session_function(**context):
+    session.commit()
+    session.close()
 
 def print_configuration_function(**context):
     logging.info("Loading Configurations...")
@@ -73,13 +104,6 @@ def print_configuration_function(**context):
     logging.info("Setting max_execution_date to XCom for Downstream Processes")
     context["ti"].xcom_push(key="max_date", value=max_date)
 
-print_configuration = PythonOperator(
-    task_id='print_configuration',
-    python_callable=print_configuration_function,
-    provide_context=True,
-    dag=dag)
-
-
 def cleanup_function(**context):
 
     logging.info("Retrieving max_execution_date from XCom")
@@ -98,9 +122,11 @@ def cleanup_function(**context):
 
     logging.info("Running Cleanup Process...")
 
-    entries_to_delete = session.query(airflow_db_model).filter(
+    entries_to_delete = session.query(
+        airflow_db_model
+    ).filter(
         age_check_column <= max_date,
-        ).all()
+    ).all()
     logging.info("Process will be Deleting the following " + str(airflow_db_model.__name__) + "(s):")
     for entry in entries_to_delete:
         logging.info("\tEntry: " + str(entry) + ", Date: " + str(entry.__dict__[str(age_check_column).split(".")[1]]))
@@ -116,14 +142,32 @@ def cleanup_function(**context):
 
     logging.info("Finished Running Cleanup Process")
 
-for db_object in DATABASE_OBJECTS:
+with DAG(
+    DAG_ID,
+    default_args=default_args,
+    schedule_interval=SCHEDULE_INTERVAL,
+    start_date=START_DATE
+) as dag:
 
-    cleanup = PythonOperator(
-        task_id='cleanup_' + str(db_object["airflow_db_model"].__name__),
-        python_callable=cleanup_function,
-        params=db_object,
-        provide_context=True,
-        dag=dag
+    close_session = PythonOperator(
+        task_id='close_session',
+        python_callable=close_session_function,
     )
 
-    print_configuration.set_downstream(cleanup)
+    print_configuration = PythonOperator(
+        task_id='print_configuration',
+        python_callable=print_configuration_function,
+        provide_context=True,
+    )
+
+    for db_object in DATABASE_OBJECTS:
+
+        cleanup = PythonOperator(
+            task_id='cleanup_' + str(db_object["airflow_db_model"].__name__),
+            python_callable=cleanup_function,
+            params=db_object,
+            provide_context=True,
+        )
+
+        print_configuration >> cleanup
+        cleanup >> close_session
