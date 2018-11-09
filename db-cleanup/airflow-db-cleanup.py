@@ -23,7 +23,7 @@ from airflow.models import (
 )
 from airflow.operators.python_operator import PythonOperator
 from airflow.utils import dates
-from datetime import datetime, timedelta
+from datetime import timedelta
 import logging
 
 # DAG id
@@ -90,7 +90,7 @@ def print_configuration_function(**context):
     if max_db_entry_age_in_days is None:
         logging.info("maxDBEntryAgeInDays conf variable isn't included. Using Default '" + str(DEFAULT_MAX_DB_ENTRY_AGE_IN_DAYS) + "'")
         max_db_entry_age_in_days = DEFAULT_MAX_DB_ENTRY_AGE_IN_DAYS
-    max_date = datetime.now() + timedelta(-max_db_entry_age_in_days)
+    max_date = dates.days_ago(0) + timedelta(-max_db_entry_age_in_days)
     logging.info("Finished Loading Configurations")
     logging.info("")
 
